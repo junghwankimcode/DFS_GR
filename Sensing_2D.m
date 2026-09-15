@@ -4,18 +4,20 @@ clear; %clc;
 % 1) Simulation parameters
 P1 = 512; P2 = 64;                 % P1: slow-time (Doppler bins), P2: freq (Delay bins)
 SNR_dB = -6;
-numIterations = 1e2;
+numIterations = 1e3;
 
-c_speed      = physconst("lightspeed");
+c_speed      = 3e8; %physconst("lightspeed");
 carrier_freq = 28e9;
 delta_f      = 480e3;
 T            = 1/delta_f;           % OFDM symbol duration
 
 % Bin resolutions (radar round-trip assumed)
-range_per_bin = c_speed / (2 * P2 * delta_f);
+fs = P2*delta_f;
+range_per_bin = c_speed / (2*fs);
+%range_per_bin = c_speed / (2 * P2 * delta_f);
 vel_per_bin   = c_speed / (2 * carrier_freq * P1 * T);
 
-K = 8                               % number of paths for TF-channel generator
+K = 1                             % number of paths 
 
 % Proposed symbol set (Golomb ruler)
 phi  = 1/13;
@@ -41,21 +43,6 @@ for iter = 1:numIterations
     % (1) Proposed
     X_prop = dSet(randi([1 4], P1, P2));
     Y_p    = awgn(H_true .* X_prop, SNR_dB, 'measured');
-
-    % % (2) ZC (across frequency axis)
-    % numbers = primes(P2);
-    % r_cand  = numbers(gcd(numbers, P2) == 1);
-    % r       = r_cand(randi(length(r_cand)));
-    % zc_base = zadoffChuSeq(r, P2);
-    % X_zc    = repmat(zc_base.', P1, 1);
-    % Y_zc    = awgn(H_true .* X_zc, SNR_dB, 'measured');
-    % 
-    % % (3) M-seq (across frequency axis)
-    % % NOTE: depending on your MATLAB version, mlseq input may be "order" not "length".
-    % % If your mlseq expects order, replace: m_base = mlseq(9);  then ensure length==511.
-    % m_base = mlseq(P2);
-    % X_m    = repmat(m_base.', P1, 1);
-    % Y_m    = awgn(H_true .* X_m, SNR_dB, 'measured');
 
     % (4) OTFS (4-QAM) - "OTFS-consistent" DD-domain single-tap model + DD matched filter
     % Use the SAME R_true, V_true so the physical truth is consistent.
@@ -116,7 +103,7 @@ fprintf('%s\n', line_sep);
 %                     Functions
 
 
-function [Rhat, Vhat] = rd_peak_from_tf(Y, X, P1, P2, range_per_bin, vel_per_bin)
+function [Rhat, Vhat] = rd_peak_from_tf(Y, X, P1, P2, ~, vel_per_bin)
     % RD-map from TF-like grid:
     % diff = Y .* conj(X) ~ H + noise (if |X|=1)
     % range: IFFT along dim-2, doppler: FFT along dim-1
@@ -134,7 +121,9 @@ function [Rhat, Vhat] = rd_peak_from_tf(Y, X, P1, P2, range_per_bin, vel_per_bin
     lag_v = mod(v_idx - 1 + half_P1, P1) - half_P1;
 
     % Physical mapping
-    Rhat = lag_r * range_per_bin;
+    %Rhat = lag_r * range_per_bin;
+    c_speed = 3e8; fs = 64*480e3;
+    Rhat = lag_r * c_speed / (2*fs);
     Vhat = lag_v * vel_per_bin;
 end
 
@@ -143,10 +132,10 @@ function [Rhat, Vhat, RD, info] = otfs_rd_peak_multipath( R_true, V_true, K, K_d
     P1, P2, delta_f, T, fc, c, ...
     SNR_dB)
 
-% OTFS RD-map baseline (DD-domain):
-% Y_DD = sum_p alpha_p * circshift(X_DD, [k_p, ell_p]) + W
-% RD   = ifft2( fft2(Y_DD) .* conj(fft2(X_DD)) )
-% Peak -> (k,ell) -> (v,R)
+    % OTFS RD-map baseline (DD-domain):
+    % Y_DD = sum_p alpha_p * circshift(X_DD, [k_p, ell_p]) + W
+    % RD   = ifft2( fft2(Y_DD) .* conj(fft2(X_DD)) )
+    % Peak -> (k,ell) -> (v,R)
 
     % 0) constants
     range_per_bin = c / (2 * P2 * delta_f);
@@ -176,8 +165,12 @@ function [Rhat, Vhat, RD, info] = otfs_rd_peak_multipath( R_true, V_true, K, K_d
     for p = 1:K
         % --- gains (Rician) ---
         if p == 1
+            if K == 1
+                alpha(p) = exp(1j*2*pi*rand);
+            else
             % deterministic dominant (unit-magnitude with random phase) scaled by sqrt(K/(K+1))
-            alpha(p) = sqrt(K_lin/(K_lin+1)) * exp(1j*2*pi*rand);
+                alpha(p) = sqrt(K_lin/(K_lin+1)) * exp(1j*2*pi*rand);
+            end
         else
             % Rayleigh scatter part total power = 1/(K+1), equally split
             alpha(p) = sqrt(1/(K_lin+1)) * (randn + 1j*randn) / sqrt(2*(K-1));
@@ -186,18 +179,32 @@ function [Rhat, Vhat, RD, info] = otfs_rd_peak_multipath( R_true, V_true, K, K_d
         % --- physical -> bins (GRID-ALIGNED) ---
         tau = 2 * R_all(p) / c;          % round-trip delay
         fD  = 2 * V_all(p) * fc / c;     % round-trip Doppler
+        
+        % ---- ON-GRID-----
+        % ell = mod(round(tau * delta_f * P2), P2);   % delay bin 0..P2-1
+        % 
+        % k_raw = round(fD * T * P1);                 % possibly negative
+        % k_cent = mod(k_raw + halfP1, P1) - halfP1;  % centered bin in [-P1/2, P1/2)
+        % k_shift = mod(k_cent, P1);                  % shift index 0..P1-1
+        % 
+        % k_bins(p) = k_cent;     % store centered index for interpretation
+        % l_bins(p) = ell;
+        % 
+        % % --- DD convolution: circshift ---
+        % Y_DD_ideal = Y_DD_ideal + alpha(p) * circshift(X_DD, [k_shift, ell]);
 
-        ell = mod(round(tau * delta_f * P2), P2);   % delay bin 0..P2-1
 
-        k_raw = round(fD * T * P1);                 % possibly negative
-        k_cent = mod(k_raw + halfP1, P1) - halfP1;  % centered bin in [-P1/2, P1/2)
-        k_shift = mod(k_cent, P1);                  % shift index 0..P1-1
+        % --- OFF-GRID: fractional bins (no round) ---
+        ell_f = tau * delta_f * P2;     % real-valued delay bin
+        k_f   = fD  * T       * P1;     % real-valued doppler bin
 
-        k_bins(p) = k_cent;     % store centered index for interpretation
-        l_bins(p) = ell;
+        % Debug
+        l_bins(p) = mod(ell_f, P2);
+        k_bins(p) = mod(mod(k_f, P1) + halfP1, P1) - halfP1;
 
-        % --- DD convolution: circshift ---
-        Y_DD_ideal = Y_DD_ideal + alpha(p) * circshift(X_DD, [k_shift, ell]);
+        % --- OFF-GRID fractional circular shift ---
+        X_shift = frac_circshift2(X_DD, k_f, ell_f);
+        Y_DD_ideal = Y_DD_ideal + alpha(p) * X_shift;
     end
 
     % 3) noise
@@ -229,4 +236,21 @@ function [Rhat, Vhat, RD, info] = otfs_rd_peak_multipath( R_true, V_true, K, K_d
     info.true_alpha  = alpha;
     info.peak_k = lag_k;
     info.peak_l = lag_l;
+    
+    % if p==1
+    % disp([k_f, ell_f])
+    % end
+end
+
+
+function Xs = frac_circshift2(X, k, ell)
+% fractional circular shift (k: dim1, ell: dim2), k/ell can be real
+    [P1,P2] = size(X);
+
+    u = ifftshift(0:P1-1);
+    v = ifftshift(0:P2-1);
+    [U,V] = ndgrid(u,v);
+
+    H = exp(-1j*2*pi*( (k/P1)*U + (ell/P2)*V ));
+    Xs = ifft2( fft2(X) .* H );
 end
